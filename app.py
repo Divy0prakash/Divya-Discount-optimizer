@@ -325,14 +325,22 @@ def train_models(df_hash: int, df: pd.DataFrame) -> dict:
 # ===========================================================================
 # ⑥ RECOMMENDATION ENGINE
 # ===========================================================================
-def safe_norm(arr: np.ndarray) -> np.ndarray:
+def safe_norm(col) -> np.ndarray:
     """
-    Min-max normalise a 1-D numpy array to [0, 1].
+    Min-max normalise to [0, 1] — always returns a plain numpy float64 array.
 
-    Accepts numpy arrays (not pandas Series) so there is zero risk of
-    index-label misalignment during arithmetic.  A tiny epsilon in the
-    denominator prevents division-by-zero when all values are identical.
+    Accepts either a pandas Series or a numpy array.  The explicit
+    `.to_numpy()` conversion means:
+      • pandas never attempts index-label alignment during arithmetic
+      • duplicate / sparse index labels cannot cause a ValueError
+      • the result is always positional (shape-matched, not label-matched)
+
+    A small epsilon in the denominator prevents division-by-zero when
+    all values in the column are identical.
     """
+    # Accept Series or ndarray — extract raw values either way
+    arr = col.to_numpy(dtype=float) if hasattr(col, "to_numpy") else np.asarray(col, dtype=float)
+    arr = np.nan_to_num(arr, nan=0.0, posinf=0.0, neginf=0.0)   # neutralise any NaN/Inf
     mn, mx = arr.min(), arr.max()
     return (arr - mn) / (mx - mn + 1e-9)
 
@@ -343,74 +351,71 @@ def build_recommendations(df: pd.DataFrame, model_info: dict,
     Scores every product by a weighted popularity function,
     predicts the optimal discount, and returns the top_n products.
 
-    Root-cause fix
-    --------------
-    The original ValueError ("cannot reindex on an axis with duplicate
-    labels") is triggered because ``df`` is a cleaned slice that may
-    carry a non-contiguous or duplicated RangeIndex.  When pandas adds
-    two Series it aligns them on their index labels first; duplicate
-    labels make alignment ambiguous and raise the error.
+    Why the original code raised ValueError
+    ----------------------------------------
+    ``df`` may arrive as a slice with a non-contiguous or duplicated
+    RangeIndex (e.g. [0,0,3,7,7,12]).  The old ``safe_norm()`` returned
+    a pandas Series that inherited that index.  When pandas adds two
+    Series it aligns them on their *label*, not their *position* — with
+    duplicate labels that alignment is ambiguous and raises:
+        ValueError: cannot reindex on an axis with duplicate labels
 
-    Fix strategy
-    ------------
-    1. ``reset_index(drop=True)`` immediately after the copy so df2 has
-       a clean 0-based integer index with no duplicates.
-    2. Extract every column used in the popularity formula as a raw
-       ``numpy`` array via ``.to_numpy()``.  NumPy arithmetic is purely
-       positional — it never looks at index labels — so misalignment is
-       impossible by construction.
-    3. ``safe_norm()`` now accepts and returns a numpy array, not a
-       Series, for the same reason.
+    Three-layer defence applied here
+    ---------------------------------
+    1. ``reset_index(drop=True)`` immediately after the copy gives df2 a
+       clean 0…N-1 RangeIndex with guaranteed-unique labels.
+    2. Every column fed into the popularity formula is extracted with
+       ``.to_numpy(dtype=float)`` before arithmetic — NumPy operates
+       positionally and never inspects index labels.
+    3. ``safe_norm()`` itself calls ``.to_numpy()`` internally, so it is
+       safe even if a caller accidentally passes a raw Series.
     """
     best_name = model_info["best_name"]
     best      = model_info["results"][best_name]
     model     = best["model"]
     scaler    = model_info["scaler"]
 
-    # ── Build working copy with a guaranteed clean index ──────────────
+    # ── 1. Build a clean, isolated working copy ────────────────────────
     needed_cols = FEATURES + ["product_id", "category", "price", "season", "festival"]
     available   = [c for c in needed_cols if c in df.columns]
+
     df2 = (
         df[available]
         .dropna(subset=FEATURES)
         .copy()
-        .reset_index(drop=True)          # ← eliminates duplicate / sparse labels
+        .reset_index(drop=True)   # ← THE critical line: wipes out any duplicate labels
     )
-
-    # Defensive guard: surface any remaining duplicates loudly rather
-    # than silently producing wrong results downstream.
-    if df2.index.duplicated().any():
-        raise AssertionError(
-            "build_recommendations: df2 still has duplicate index labels after "
-            "reset_index — this should never happen; please file a bug report."
-        )
 
     if len(df2) == 0:
         st.warning("⚠️  No products remain after dropping NaN feature rows.")
         return pd.DataFrame()
 
-    # ── Popularity score — all arithmetic is on numpy arrays ──────────
-    # Extract as numpy so pandas never attempts index alignment.
-    units       = df2["units_sold"].to_numpy(dtype=float)
-    interact    = df2["interaction_score"].to_numpy(dtype=float)
-    sentiment   = df2["sentiment_score"].to_numpy(dtype=float)
-    festival    = df2["festival"].to_numpy(dtype=float)
-    sales_val   = df2["sales_value"].to_numpy(dtype=float) if "sales_value" in df2.columns \
-                  else units * df2["price"].to_numpy(dtype=float)
+    # ── 2. Extract all scoring columns as raw numpy arrays ────────────
+    #    .to_numpy() breaks the link to the pandas index entirely.
+    #    np.nan_to_num inside safe_norm() handles any residual NaN/Inf.
+    units     = df2["units_sold"].to_numpy(dtype=float)
+    interact  = df2["interaction_score"].to_numpy(dtype=float)
+    sentiment = df2["sentiment_score"].to_numpy(dtype=float)
+    festival  = np.nan_to_num(df2["festival"].to_numpy(dtype=float), nan=0.0)
 
+    if "sales_value" in df2.columns:
+        sales_val = df2["sales_value"].to_numpy(dtype=float)
+    else:
+        sales_val = units * df2["price"].to_numpy(dtype=float)
+
+    # ── 3. Weighted popularity score — pure numpy, no pandas alignment ─
     pop_score = (
-        0.40 * safe_norm(units)
+          0.40 * safe_norm(units)
         + 0.25 * safe_norm(interact)
-        + 0.20 * safe_norm(sentiment + 1)   # shift to [0, 2] before normalising
-        + 0.10 * festival
+        + 0.20 * safe_norm(sentiment + 1.0)   # shift [-1,1] → [0,2] first
+        + 0.10 * festival                      # already 0/1 float, no norm needed
         + 0.05 * safe_norm(sales_val)
-    )
+    )   # result: numpy array, shape (len(df2),), dtype float64
 
-    # Assign back as a plain numpy array — no index clash possible
-    df2["pop_score"] = pop_score
+    df2["pop_score"] = pop_score   # safe: same length as df2, assigned positionally
 
-    # ── Model prediction ───────────────────────────────────────────────
-    X = df2[FEATURES].to_numpy(dtype=float)   # numpy → model is always safe
+    # ── 4. Model prediction — use numpy matrix directly ────────────────
+    X = df2[FEATURES].to_numpy(dtype=float)
     if best.get("scaled"):
         X = scaler.transform(X)
 
@@ -420,7 +425,7 @@ def build_recommendations(df: pd.DataFrame, model_info: dict,
         df2["price"] * (1 - df2["recommended_discount_pct"] / 100)
     ).round(2)
 
-    # ── Return top-N ───────────────────────────────────────────────────
+    # ── 5. Return top-N with a clean 1-based display index ─────────────
     keep = ["product_id", "category", "price", "effective_price",
             "recommended_discount_pct", "sentiment_score",
             "pop_score", "units_sold", "season", "festival"]
